@@ -1,0 +1,1011 @@
+
+---
+title: "Standard IMC Pipeline"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load Libraries and Functions
+```{r echo=F}
+library(Rcpp)
+library(Rphenograph)
+library(data.table)
+library(tidyverse)
+library(gridExtra)
+library(pheatmap)
+library(uwot)
+library(spatstat)
+library(viridis)
+library(tidyr)
+library(stringi)
+library(parallel)
+library(doParallel)
+library(EBImage)
+
+# Set number of cores
+print(paste0(detectCores()," cores available"))
+cores <- floor(detectCores()/2)
+print(paste0("set cores to ", cores))
+
+# Load scaling function
+quickscale <- function(data, percentile=0.99){
+  highlim <- quantile(data, percentile)
+  lowlim <- quantile(data, 1-percentile)
+  data <- (data-lowlim)/(highlim-lowlim)
+  data[data<0] <- 0
+  data[data>1] <- 1
+  return(data)
+}
+
+censor <- function(data, percentile=0.99, cap=NA){
+  data <- as.matrix(data)
+  if(is.na(cap)){
+    highlim <- quantile(data, percentile)
+  } else {
+    highlim <- cap
+  }
+  lowlim <- quantile(data, 1-percentile)
+  data[data<lowlim] <- lowlim
+  data[data>highlim] <- highlim
+  return(as.data.table(data))
+}
+# Slightly faster version of Rphenograph
+Rphenographslim <- function (data, k = 30) {
+  
+  neighborMatrix <- RANN::nn2(data, data, k+1, searchtype = "standard")[[1]][, -1]
+  links <- Rphenograph:::jaccard_coeff(neighborMatrix)
+  links <- links[links[, 1] > 0, ]
+  relations <- as.data.frame(links)
+  colnames(relations) <- c("from", "to", "weight")
+  g <- igraph::graph.data.frame(relations, directed = FALSE)
+  community <- igraph::cluster_louvain(g)
+  return(community)
+}
+
+# If Rphenograph leaves out cells, increases k
+Rphenographiterator <- function(data,k)
+{
+  set.seed(87)
+  loop <- T
+  while(loop == T)
+  {
+    Rpheno <- Rphenographslim(data,k)
+    if(length(Rpheno$membership)<nrow(data)){k <- k+2} else {loop <- F}
+  }
+  return(Rpheno)
+}
+
+Entropycalc <- function(data){
+  probs <- data/sum(data)
+  return(sum(sapply(probs, function(x) -x*log(x))))
+}
+
+
+
+edgedetection <- function(inputset,k=10, limit=0.3, Spreadk=5,Spreadlimit="AUTO"){
+  # midpoints
+  midX <- (max(inputset$Location_Center_X)-min(inputset$Location_Center_X))/2
+  midY <- (max(inputset$Location_Center_Y)-min(inputset$Location_Center_Y))/2
+  
+  X <- ppp(x = inputset[,Location_Center_X], 
+           y = inputset[,Location_Center_Y],
+           window = owin(c(inputset[,min(Location_Center_X)],
+                           inputset[,max(Location_Center_X)]),
+                         c(inputset[,min(Location_Center_Y)],
+                           inputset[,max(Location_Center_Y)])),
+           # marks = ROIsubset[,..PointDatalocation],
+           unitname = "micrometer")
+  Y <- ppp(x = midX, 
+           y = midY,
+           window = owin(c(inputset[,min(Location_Center_X)],
+                           inputset[,max(Location_Center_X)]),
+                         c(inputset[,min(Location_Center_Y)],
+                           inputset[,max(Location_Center_Y)])),
+           # marks = ROIsubset[,..PointDatalocation],
+           unitname = "micrometer")
+  Z <- crossdist(Y,X)[1,]
+  NNs <- nnwhich(X, k=1:k)
+  edgeindex <- vector("logical", nrow(inputset))
+  for(i in 1:length(edgeindex)){
+    edgeindex[i] <- sum(Z[NNs[i,]]>Z[i])<k*limit
+  }
+  
+  XX <- ppp(x = inputset[edgeindex,Location_Center_X],
+            y = inputset[edgeindex,Location_Center_Y],
+            window = owin(c(inputset[,min(Location_Center_X)],
+                            inputset[,max(Location_Center_X)]),
+                          c(inputset[,min(Location_Center_Y)],
+                            inputset[,max(Location_Center_Y)])),
+            # marks = ROIsubset[,..PointDatalocation],
+            unitname = "micrometer")
+  
+  hemi <- inputset[edgeindex, Location_Center_Y]>midY
+  angles <- atan((inputset[edgeindex,Location_Center_Y]-midY)/(inputset[edgeindex,Location_Center_X]-midX))
+  ZZ <- crossdist(Y,XX)[1,]
+  NNXXs <- nnwhich(XX, k=1:Spreadk)
+  NNrange <- vector("numeric", length(ZZ))
+  for(i in 1:length(NNrange)){
+    NNrange[i] <- diff(range(ZZ[NNXXs[i,]]))
+  }
+  NNray <- vector("numeric", length(ZZ))
+  for(i in 1:length(NNray)){
+    NNray[i] <- max(ZZ[which(abs(angles-angles[i])<0.03 & hemi==hemi[i])])
+  }
+  
+  if(Spreadlimit=="Auto"){Spreadlimit <- mean(NNrange)+1.5*sd(NNrange)}
+  
+  orphanindex <- NNrange>Spreadlimit | 0.95*NNray>ZZ
+  
+  edgeindex[which(edgeindex)[orphanindex]] <- F
+  edgeindex
+}
+
+heatmapwrap <- function(datainput, columns, rows, title=NA, breaks=seq(0,1,0.01), scale_all = F, cluster_cols = F,
+                        cluster_rows = T, display_numbers = F, scaled = NA, rankby = NA){
+  if (is.na(title)){
+    title <- deparse(substitute(datainput))
+  }
+  
+  heatmap_data <- datainput[, lapply(.SD, function(x) median(x, na.rm=T)), by=rows, .SDcols=columns]
+  heatmap_counts <- datainput[, .N, by=rows]
+  
+  heatmap_data <- merge(heatmap_data, heatmap_counts, by=rows)
+  
+  heatmap_data[, percentage := N/sum(N)]
+  heatmap_data[, percentageoutput := paste0(paste(get(rows), format(100*percentage,digits = 2), sep = ":"),"%")]
+  if(scale_all){
+    heatmap_data[, (columns) := lapply(.SD, function(x) quickscale(x,1)), .SDcols = columns]
+  }
+  if(!is.na(scaled)){
+    heatmap_data[, (scaled) := lapply(.SD, function(x) quickscale(x,1)), .SDcols = scaled]
+  }
+  if(!is.na(rankby)){
+    cluster_rows <- F
+    neworder <- order(heatmap_data[,..rankby])
+    heatmap_data <- heatmap_data[neworder]
+  }
+  return(pheatmap(heatmap_data[,..columns], labels_row = heatmap_data[,percentageoutput], cluster_cols = cluster_cols, 
+                  cluster_rows = cluster_rows, breaks = breaks, main = title, display_numbers = display_numbers))
+}
+
+heatmapwrapsinglecell <- function(datainput, columns, rows, clustering=NA, legend=T, title=NA, scaled = NA){
+  if(is.na(clustering))
+  {
+    if (is.na(title)){
+      title <- deparse(substitute(datainput))
+    }
+    if(!is.na(scaled)){
+      datainput[, (scaled) := lapply(.SD, function(x) quickscale(x,1)), .SDcols = scaled]
+    }
+    outheat <- data.frame(as.matrix(datainput[,..columns]), row.names = 1:nrow(datainput))
+    annotation_data <- datainput[,..rows]
+    return(pheatmap(outheat, show_rownames = F, annotation_row = annotation_data, cluster_cols = F, legend = legend, annotation_legend = legend))
+  }
+  else{
+    outheat <- data.frame(as.matrix(datainput[order(datainput[[clustering]]),..columns]), row.names = 1:nrow(datainput))
+    annotation_data <- datainput[order(datainput[[clustering]]),..rows]
+    return(pheatmap(outheat, show_rownames = F, annotation_row = annotation_data, cluster_cols = F, cluster_rows = F, legend = legend, annotation_legend = legend, main = title))
+  }
+}
+
+
+umapwrap <- function(datainput, columns, rows, k=30){
+  breakline <- T
+  if(nrow(datainput)>50000)
+  {
+    breakline <- as.logical(readline(paste0(nrow(datainput), " cells, proceed? T or F")))
+  }
+  if(breakline==T)
+  {
+    set.seed(1234)
+    data_umap <- umap(datainput[,..columns], k)
+    datainput[,c("umapx", "umapy") := split(data_umap, rep(1:ncol(data_umap), each = nrow(data_umap)))]
+    ggplot(datainput)+
+      geom_point(aes(x=umapx, y=umapy, color=factor(get(rows))))+
+      geom_label(data=datainput[, lapply(.SD,mean), by=rows, .SDcols=c("umapx","umapy")], aes(x=umapx, y=umapy, color = factor(get(rows)), label=gsub("meta_core_","",get(rows))), alpha=0.8, nudge_x = 0.5, nudge_y=0.5)+
+      theme_bw()
+  }
+}
+
+
+```
+Load data
+```{r}
+# Load cell level data 
+data_in <- fread("FongReprocessed.csv")
+
+# Load antibody panel 
+panel <- fread("cHL_fong_cohort_panel.csv")
+
+# Load morphology data
+morpho_data_in <- fread("appended.csv")
+
+```
+
+Format data 
+```{r}
+# Choose variables for analyses
+panel_proteins <- panel$Antibody
+panel_proteins[duplicated(panel_proteins)] <- paste0(panel_proteins[duplicated(panel_proteins)],"1")
+
+# Label channel names (replace default names with antibody targets)
+cols_to_change <- grep("^.*_c.*$", colnames(data_in))
+colnames(data_in) <- sub("^.*_c", "", colnames(data_in))
+
+colnames(data_in)[cols_to_change] <- panel_proteins[as.numeric(colnames(data_in)[cols_to_change])]
+
+# Factor columns
+factorconvert <- c("Diagnostic","Relapse","EBV","MHCII","PS","Unique_ROI_ID","TMA_ID","res_id")
+data_in[,(factorconvert) := lapply(.SD, function(x) factor(x)), .SDcols=factorconvert]
+
+# Morphology Analysis
+morpho_data_in[, sample := tstrsplit(sample, "\\\\", keep = 2)]
+morpho_data_in[, FileName := str_replace(sample, "_ilastik.*$", "")]
+morpho_data_in[, `:=` (Location_Center_X = as.numeric(str_match(centroid, "[(](.*?), (.*?)[)]")[,3]),
+                       Location_Center_Y  = as.numeric(str_match(centroid, "[(](.*?), (.*?)[)]")[,2]))]
+
+colnames(morpho_data_in)[2] <- "ObjectNumber"
+# morpho_data_in[, ObjectNumber := factor(ObjectNumber)]
+morpho_data_in[, `:=` (Location_Center_X = round(Location_Center_X,0),
+                       Location_Center_Y = round(Location_Center_Y,0))]
+data_in[, `:=` (Location_Center_X = round(Location_Center_X,0),
+                Location_Center_Y = round(Location_Center_Y,0))]
+
+data_in <- merge(data_in, 
+              morpho_data_in[,.(area, eccentricity, perimeter, FileName, ObjectNumber, Location_Center_X, Location_Center_Y)],
+              by = c("FileName", "Location_Center_X", "Location_Center_Y", "ObjectNumber"),
+              sort=F)  
+
+```
+
+Choose markers for phenotyping
+```{r}
+#select lineage defining markers for cell phenotyping
+
+corephenotypingmarkers <- c("CD3","CD4","Foxp3","CD8a","CD14","CD68","CD11b","CD11c","CD123","CD20","CD30","CD31")
+
+#select additional phenotyping markers to help identify major cell types 
+phenotypingmarkers <- c("CD3", "CD4", "Foxp3", "CXCR5", "CD8a",
+                        "CD20", "CD14", "CD68", "CD11b", "CD163", "CD11c", "CD123", "GranzymeB", "CD45RO", "HLADPDQDR","CD30", "CD31", "eccentricity", "area", "perimeter")
+```
+
+
+
+Quality Control 
+```{r}
+
+##QC, choose metrics to filter cells by
+
+#count number of cells per ROI 
+data_in[,ROI_N := .N, by=Unique_ROI_ID]
+
+#count number of cells per patient 
+data_in[,Core_N := .N, by=.(Surgical_Number, Core_Number)]
+
+#remove cells with area less than 15 pixels
+data_in <- data_in[!(area < 15)]
+
+#remove cells with area greater than 300 pixels
+data_in <- data_in[!(area > 300)]
+
+#remove ROIs with less than 1,000 cells
+data_in <- data_in[!(ROI_N < 1000)]
+
+#remove Patients with less than 10,000 cells
+data_in <- data_in[!(Core_N < 10000)]
+
+```
+
+Find Edge Cells for Spatial Analysis
+```{r}
+# Obtain each ROI/Core
+ROIs <- unique(data_in$Unique_ROI_ID)
+Edges <- vector("list",length(ROIs))
+#Find edge cells
+data_in <- droplevels(data_in)
+ROIiterator <- isplit(data_in, data_in$Unique_ROI_ID)
+Edges <- foreach(k = ROIiterator, .export = "edgedetection") %do%
+  {
+    edgedetection(k$value, 20, 0.45, 5, "Auto")
+  }
+
+
+for (k in 1:length(ROIs)){
+  set(data_in, i = which(data_in$Unique_ROI_ID==levels(data_in$Unique_ROI_ID)[k]), "edgecell", 
+      Edges[[k]])
+}
+```
+
+Scaling of Data
+```{r}
+data_in[, (panel_proteins) := lapply(.SD, function(x) quickscale(asinh(x*2^16/5),0.99)), .SDcols = panel_proteins] 
+morphologymarkers <- c("area","perimeter","eccentricity")
+data_in[, (morphologymarkers) := lapply(.SD, function(x) quickscale(x,1)), .SDcols = morphologymarkers]
+```
+
+Cell phenotyping with Phenograph
+```{r}
+# Select phenograph level: "all" or a specific variable (patient, ROI, etc)
+phenographlevel <- "all"
+k <- 5
+
+if (phenographlevel == "all"){
+  Rmajorpheno <- Rphenographiterator(data_in[,..corephenotypingmarkers], k)
+}
+
+#list of patients
+phenographfactors <- unique(data_in[[phenographlevel]])
+
+# Initialize column for phenographs
+data_in[,"meta_core_phenograph" := factor()]
+
+# Add phenograph clusters for each patient core to data table
+majorphenographphenos <- vector("list",length(phenographfactors))
+majorphenographiterator <- isplit(data_in, data_in[[phenographlevel]])
+c1 <- makeCluster(cores)
+registerDoParallel(c1)
+Rmajorphenos <- foreach(k = majorphenographiterator, .packages = c("Rcpp","Rphenograph","data.table"), .export = "corephenotypingmarkers") %dopar%
+  {
+    paste0("meta_core_", Rphenographiterator(k$value[, ..corephenotypingmarkers], k)$membership)
+  }
+stopCluster(c1)
+
+for (k in 1:length(phenographfactors))
+{
+  set(data_in, i = which(data_in[[phenographlevel]]==levels(data_in[[phenographlevel]])[k]), "meta_core_phenograph", Rmajorphenos[[k]])
+}
+
+# Find the median expression level of each ROI phenograph cluster
+meta_data_in <- data_in[, lapply(.SD, median), by=.(get(phenographlevel), meta_core_phenograph), .SDcols=c(panel_proteins,morphologymarkers)]
+
+meta_data_counts <- data_in[, .N, by=.(get(phenographlevel), meta_core_phenograph)]
+
+meta_phenograph <- Rphenographiterator(meta_data_in[, ..corephenotypingmarkers],k)
+
+# Phenograph all the ROI cluster medians
+meta_data_in[, core_phenograph := factor(paste0("core_", meta_phenograph$membership), levels = gtools::mixedsort(unique(paste0("core_", meta_phenograph$membership))))]
+
+meta_data_in[, core_N := meta_data_counts[,N]]
+
+meta_data_in[, core_entropy := Entropycalc(core_N), by = phenographlevel]
+
+meta_data_in[, meta_core_N := sum(core_N), by=.(phenographlevel, meta_core_phenograph)]
+
+meta_data_in[, meta_core_entropy := Entropycalc(meta_core_N[!duplicated(meta_core_phenograph)]), by = phenographlevel]
+
+core_meta_umap <- umap(meta_data_in[,..corephenotypingmarkers])
+
+meta_data_in[,c("core_umap_x","core_umap_y") := split(core_meta_umap, rep(1:ncol(core_meta_umap), each=nrow(core_meta_umap)))]
+
+# Blend ROI cluster medians with full data
+data_in <- merge(data_in, meta_data_in[, list(get(phenographlevel), core_phenograph, meta_core_phenograph,
+                                                      meta_core_N, core_entropy, meta_core_entropy)],
+                 by = c(phenographlevel, "core_phenograph"), sort=F)
+
+metacluster_medians <- data_in[,lapply(.SD, median), by=core_phenograph, .SDcols=corephenotypingmarkers]
+metacluster_medians[, (corephenotypingmarkers) := lapply(.SD, function(x) (x-mean(x))/sd(x)), .SDcols = corephenotypingmarkers]
+setkey(metacluster_medians, core_phenograph)
+metacluster_medians[, automatedclusters := list()]
+
+```
+
+Choose supervised clusters
+
+```{r}
+gates <- list(c("CD4","CD4>0.5 & CD3>0.5 & Foxp3<0.5"),
+              c("Treg","CD4>0.5 & CD3>0.5 & Foxp3>0.5"),
+              c("CD8","CD8>0.5 & CD3>0.5"),
+              c("Myel","CD14>0.5 | CD11b>0.5"),
+              c("Mac","CD68>0.5"),
+              c("cDC","CD11c>0.5"),
+              c("pDC","CD123>0.5 & CD11c<0.5 & CD31>0.5"),
+              c("B","CD20>0.5"),
+              c("HRS","CD30>0.5"),
+              c("Endo","CD31>0.5")
+              )
+
+for (i in gates){
+ metacluster_medians[eval(parse(text=i[2])), automatedclusters :=lapply(metacluster_medians[eval(parse(text=i[2]))]$automatedclusters, function(x) append(x,i[1]))]
+}
+set(metacluster_medians, i=which(sapply(metacluster_medians$automatedclusters, is.empty)), "automatedclusters", value = "Unknown")
+
+
+```
+
+Generation of heatmaps
+```{r}
+automatedclusters <- sapply(metacluster_medians$automatedclusters, function(x) paste(unique(x), collapse = "_"))
+
+# Name supervised_core_phenograph by simple test
+data_in[,"supervised_core_phenograph" := factor(automatedclusters[as.numeric(sapply(strsplit(as.character(data_in$core_phenograph), "_"),"[", 4))])]
+
+# Collect cell types
+celltypes <- unique(automatedclusters)
+
+# Use phenotyping to identify pure and impure cells inclusters
+data_in[,"subset_phenograph" := factor()]
+
+
+Rsubphenos <- vector("list", length(celltypes))
+Celltypeiterator <- isplit(data_in, data_in$supervised_core_phenograph)
+c1 <- makeCluster(cores)
+registerDoParallel(c1)
+Rsubphenos <- foreach(k = Celltypeiterator, .packages = c("Rcpp","Rphenograph","data.table"), .export = c("phenotypingmarkers")) %dopar%
+  {
+    paste0("subset_", k$key[[1]], "_", Rphenographiterator(k$value[, ..phenotypingmarkers],15)$membership)
+  }
+stopCluster(c1)
+
+# Generate heatmaps for each cluster 
+for (type in 1:length(levels(data_in$supervised_core_phenograph))){
+  print(levels(data_in$supervised_core_phenograph)[type])
+  
+  data_in[supervised_core_phenograph==levels(data_in$supervised_core_phenograph)[type], "subset_phenograph" := Rsubphenos[[type]]]
+  
+  p <- heatmapwrap(data_in[supervised_core_phenograph==levels(data_in$supervised_core_phenograph)[type]], phenotypingmarkers, "subset_phenograph", title = levels(data_in$supervised_core_phenograph)[type], display_numbers = T)
+
+  assign(paste0(levels(data_in$supervised_core_phenograph)[type],"heatmap"), p)
+}
+
+```
+
+Manual editing for reclustering assignment
+Look through heatmaps and identify mislabeled clusters
+Format is celltype to convert to/cluster found in/cluster numbers mislabeled
+```{r}
+supervisedclusters <- data.table(CD4 = list("CD4",
+                                            c("CD4_B",
+                                              "CD4_cDC_pDC",
+                                              "CD8",
+                                              "Unknown"),
+                                            list(c(1,17),
+                                                 c(26,1,29,16,27,18,8,4,20,22,31,12,14,13,6,2),
+                                                 c(21,31,12,9),
+                                                 c(6,27,26))),
+                                 CD8 = list("CD8",
+                                            c(""),
+                                            list(c())),
+                                 Treg = list("Treg",
+                                             c(""),
+                                             list(c())),
+                                 Myel = list("Myel",
+                                             c("CD8",
+                                               "Myel_Mac"),
+                                             list(c(14,4),
+                                                  c(10,28,8,27,13,17))),
+                                 Mac = list("Mac",
+                                            c("Myel_Mac"),
+                                            list(c(5,1,7,22,19,18,24,30,6,29,26))),
+                                 cDC = list("cDC",
+                                            c("CD4_cDC_pDC",
+                                              "B",
+                                              "Myel_Mac"),
+                                            list(c(28,24,25),
+                                                 c(16),
+                                                 c(2))),
+                                 HRS = list("HRS",
+                                            c(""),
+                                            list(c())),
+                                 B = list("B",
+                                          c("CD4_B",
+                                            "Unknown"),
+                                          list(c(21,4,27,28,20,19),
+                                               c(8))),
+                                 Endo = list("Endo",
+                                             c(""),
+                                             list(c())),
+                                 pDC = list("pDC",
+                                            c("CD4_cDC_pDC"),
+                                            list(c(29,17,28))),
+                                 Unknown = list("Unknown",
+                                                c("B",
+                                                  "CD8",
+                                                  "Endo",
+                                                  "HRS",
+                                                  "Treg",
+                                                  "cDC"),
+                                                list(c(20,7,5,27,21,9,18),
+                                                     c(17,22,7,18,3,1,6,25),
+                                                     c(4,2,18,8,5,6,21),
+                                                     c(5,1,14,2,27,10),
+                                                     c(4),
+                                                     c(11,3)))
+)
+
+```
+
+
+```{r}
+#For each major cell type select set of functional markers for clustering
+
+CD4markers <- c("CD3","CD4","CXCR3","CXCR5","ICOS","LAG3","TIM3","Galectin9","CTLA4","PD1","PDL1","VISTA","GranzymeB","Ki67","Caspase3","CD45RO")
+
+CD8markers <- c("CD3","CD8a","Foxp3","LAG3","PD1","PDL1","GranzymeB","Ki67","Caspase3","CD45RO")
+
+Tregmarkers <- c("CD3","CD4","Foxp3","LAG3","TIM3","Galectin9","CTLA4","PD1","PDL1","VISTA","Ki67","Caspase3","CD45RO")
+
+Myelmarkers <- c("CD14","CD68","CD11b","CD163","CD123","HLAABC","HLADPDQDR","CD4","IDO","ICOSL","TIM3","Galectin9","CD80","PD1","PDL1","Ki67","Caspase3","GranzymeB")
+
+Macmarkers <- c("CD14","CD68","CD11b","CD163","CD123","HLAABC","HLADPDQDR","CD4","IDO","ICOSL","TIM3","Galectin9","CD80","PD1","PDL1","Ki67","Caspase3","GranzymeB")
+
+Bmarkers <- c("CD20","HLAABC","HLADPDQDR","CXCR5","CXCR3","Ki67","Caspase3")
+
+cDCmarkers <- c("CD11c","CD14","CD68","CD11b","HLAABC","HLADPDQDR","CD4","IDO","ICOSL","Galectin9","CD80","Ki67","Caspase3")
+
+pDCmarkers <- c("CD68","CD123","HLAABC","HLADPDQDR","CD4","CD31","CD11c","CXCR3","Galectin9","GranzymeB","Ki67","Caspase3")
+
+HRSmarkers <- c("CD30","HLAABC","HLADPDQDR","CXCR5","GATA3","CD123","Galectin9","CD80","PDL1","Ki67","Caspase3")
+
+Endomarkers <- c("CD31","HLAABC","HLADPDQDR","Ki67","Caspase3")
+
+
+```
+Reassignment of and reclustering of cells
+```{r}
+for (i in 1:ncol(supervisedclusters)){
+  # Identify the particular types that are incorrect
+  typestoscan <- supervisedclusters[[2,i]]
+  subclusterstoscan <- supervisedclusters[[3,i]]
+  # Find subcluster names of incorrect clusters
+  targets <- vector("character")
+  for (j in 1:length(typestoscan))
+  {
+    targets <- c(targets, paste0("subset_",typestoscan[j], "_", subclusterstoscan[[j]]))
+  }
+  # Relabel the incorrect clusters as corrected_core_phenograph
+  data_in[subset_phenograph %in% targets, corrected_core_phenograph := supervisedclusters[[1,i]]]
+}
+
+# All ambiguous clusters that weren't pure get moved to the unknown clusters
+data_in[corrected_core_phenograph %like% "_", corrected_core_phenograph := "Unknown"]
+
+# Recluster all the ambiguous cells
+phenographcleanup <- Rphenographiterator(data_in[corrected_core_phenograph=="Unknown", ..corephenotypingmarkers], 15)
+
+data_in[corrected_core_phenograph=="Unknown", unknowncleanup := phenographcleanup$membership]
+
+
+# For all the unknown types, redo the phenotyping clusters to obtain mixed types
+unknowntypes <- sort(unique(data_in[!is.na(unknowncleanup)]$unknowncleanup))
+Runknownphenos <- vector("list", length(unknowntypes))
+unknowntypeiterator <- isplit(data_in[!is.na(unknowncleanup)], data_in[!is.na(unknowncleanup)]$unknowncleanup)
+c1 <- makeCluster(cores)
+registerDoParallel(c1)
+Runknownphenos <- foreach(k = unknowntypeiterator, .packages = c("Rcpp","Rphenograph","data.table"), .export = c("corephenotypingmarkers")) %do%
+  {
+    paste0("unknown_", k$key[[1]], "_", Rphenographiterator(k$value[, ..corephenotypingmarkers], 15)$membership)
+  }
+stopCluster(c1)
+print("unknowncleanupdone")
+print(Sys.time())
+# For all the mixed cells, re-cluster them within the major groups
+for (type in 1:length(unknowntypes)){
+  data_in[unknowncleanup==unknowntypes[type], "unknown_sub_phenograph" := Runknownphenos[[type]]]
+
+}
+
+unknown_cluster_medians <- data_in[,lapply(.SD, median), by=unknown_sub_phenograph, .SDcols=corephenotypingmarkers]
+unknown_cluster_medians[, (corephenotypingmarkers) := lapply(.SD, function(x) (x-mean(x))/sd(x)), .SDcols = corephenotypingmarkers]
+unknown_cluster_medians <- unknown_cluster_medians[!is.na(unknown_sub_phenograph)]
+setkey(unknown_cluster_medians, unknown_sub_phenograph)
+
+automatedunknownclusters <- vector("list", nrow(unknown_cluster_medians))
+for (i in 1:nrow(unknown_cluster_medians)){
+  if(unknown_cluster_medians[i, CD4]>0.5 & unknown_cluster_medians[i, CD3]>0.5 & unknown_cluster_medians[i,Foxp3]<0.5){automatedunknownclusters[[i]] <- append(automatedunknownclusters[[i]], "CD4")}
+  if(unknown_cluster_medians[i, Foxp3]>0.5 & unknown_cluster_medians[i, CD4]>0.5 & unknown_cluster_medians[i, CD3]>0.5){automatedunknownclusters[[i]] <- append(automatedunknownclusters[[i]], "Treg")}
+  if(unknown_cluster_medians[i, CD8a]>0.5 & unknown_cluster_medians[i, CD3]>0.5){automatedunknownclusters[[i]] <- append(automatedunknownclusters[[i]], "CD8")}
+  if(unknown_cluster_medians[i, CD14]>0.5 | unknown_cluster_medians[i, CD11b]>0.5){automatedunknownclusters[[i]] <- append(automatedunknownclusters[[i]], "Myel")}
+  if(unknown_cluster_medians[i, CD68]>0.5){automatedunknownclusters[[i]] <- append(automatedunknownclusters[[i]], "Mac")}
+  if(unknown_cluster_medians[i, CD11c]>0.5 & unknown_cluster_medians[i, CD3]<0.5){automatedunknownclusters[[i]] <- append(automatedunknownclusters[[i]], "cDC")}
+  if(unknown_cluster_medians[i, CD123]>0.5 & unknown_cluster_medians[i, CD11c]<0.5 & unknown_cluster_medians[i, CD31]<0.5){automatedunknownclusters[[i]] <- append(automatedunknownclusters[[i]], "pDC")}
+  if(unknown_cluster_medians[i, CD20]>0.5){automatedunknownclusters[[i]] <- append(automatedunknownclusters[[i]], "B")}
+  if(unknown_cluster_medians[i, CD30]>0.5 & unknown_cluster_medians[i, CD11c]<0.5 & unknown_cluster_medians[i, CD31]<0.5){automatedunknownclusters[[i]] <- append(automatedunknownclusters[[i]], "HRS")}
+  if(unknown_cluster_medians[i, CD31]>0.5){automatedunknownclusters[[i]] <- append(automatedunknownclusters[[i]], "Endo")}
+  if(length(automatedunknownclusters[[i]])==0){automatedunknownclusters[[i]] <- append(automatedunknownclusters[[i]], "Null")}
+}
+
+automatedunknownclusters <- sapply(automatedunknownclusters, function(x) paste(unique(x), collapse = "_"))
+
+# Match mixed cell labels with clusters
+data_in[,"mixed_phenograph" := factor(automatedunknownclusters[match(data_in$unknown_sub_phenograph,unknown_cluster_medians$unknown_sub_phenograph)])]
+data_in[, mixed_cell := "Pure"]
+data_in[mixed_phenograph %like% "_", mixed_cell := "Mixed"]
+
+# Find number of main cell types
+correctedcelltypes <- as.character(unique(data_in$corrected_core_phenograph))
+correctedcelltypes <- correctedcelltypes[!correctedcelltypes=="Unknown"&!is.na(correctedcelltypes)]
+
+for (type in 1:length(correctedcelltypes)){
+  data_in[, paste0(correctedcelltypes[type],"_pos") := 0]
+  data_in[corrected_core_phenograph==correctedcelltypes[type] | (mixed_phenograph %like% correctedcelltypes[type]), paste0(correctedcelltypes[type],"_pos") := 1]
+}
+
+data_in <- droplevels(data_in)
+
+# Phenograph all cells in major cell types based on specific markers
+Rsubcorrectphenos <- vector("list", length(correctedcelltypes))
+c1 <- makeCluster(cores)
+registerDoParallel(c1)
+Rsubcorrectphenos <- foreach(k = correctedcelltypes, 
+                             .packages = c("Rcpp", "Rphenograph", "data.table", "iterators", "doParallel"), 
+                             .export = c("CD4markers","CD8markers","Tregmarkers","Myelmarkers","Macmarkers",
+                                         "Bmarkers","cDCmarkers","pDCmarkers","HRSmarkers","Endomarkers")) %do%
+  {
+    markers <- c(get(paste0(k, "markers")), "area", "eccentricity")
+    columnindex <- data_in[[paste0(k,"_pos")]]==1
+    data_sub <- copy(data_in[columnindex])
+    data_sub_pheno <- Rphenographiterator(data_sub[,..markers],15)
+    paste0("subset_", k, "_", data_sub_pheno$membership)
+  }
+
+for (type in 1:length(correctedcelltypes)){
+  
+  markers <- c(get(paste0(correctedcelltypes[type], "markers")), "area")
+  
+  columnindex <- data_in[[paste0(correctedcelltypes[type],"_pos")]]==1
+  
+  data_in[columnindex, paste0(correctedcelltypes[type],"_phenograph") := Rsubcorrectphenos[[type]]]
+  
+  # Rsubumap <- umap(data_in[corrected_core_phenograph==correctedcelltypes[type],..markers])
+  
+}
+
+Rsubumap <- umap(data_in[corrected_core_phenograph==correctedcelltypes[type],..markers])
+
+Rsubumaps <- vector("list", length(correctedcelltypes))
+c1 <- makeCluster(cores)
+registerDoParallel(c1)
+
+# UMAP all cell subsets
+Rsubumaps <- foreach(k = correctedcelltypes, .packages = c("uwot","data.table"), .export = c("CD4markers",
+                                                                                             "CD8markers",
+                                                                                             "Tregmarkers",
+                                                                                             "Myelmarkers",
+                                                                                             "Macmarkers",
+                                                                                             "Bmarkers",
+                                                                                             "cDCmarkers",
+                                                                                             "pDCmarkers",
+                                                                                             "HRSmarkers",
+                                                                                             "Endomarkers")) %do%
+  {
+    markers <- c(get(paste0(k, "markers")), "area", "eccentricity")
+    columnindex <- data_in[[paste0(k,"_pos")]]==1
+    umap(data_in[columnindex,..markers])
+  }
+
+
+#Edit data sets with phenograph and UMAP data
+for (type in 1:length(correctedcelltypes)){
+
+  markers <- c(get(paste0(correctedcelltypes[type], "markers")), "area")
+  columnindex <- data_in[[paste0(correctedcelltypes[type],"_pos")]]==1
+
+  data_in[columnindex, c(paste0(correctedcelltypes[type],"_umap_x"),paste0(correctedcelltypes[type],"_umap_y")) := split(Rsubumaps[[type]], rep(1:ncol(Rsubumaps[[type]]), each=nrow(Rsubumaps[[type]])))]
+
+  p <- heatmapwrap(data_in[columnindex], markers, paste0(correctedcelltypes[type],"_phenograph"), title=correctedcelltypes[type] , display_numbers = T)
+
+  assign(paste0(correctedcelltypes[type],"_specific_heatmap"), p)
+}
+
+```
+Manually assign clusters to cell subtypes of interest
+```{r}
+# Add additional _pos subsets
+newcelltypes <- data.table(Foxp3_CD8 = list("Foxp3_CD8",
+                                            c("CD8"),
+                                            list(c(14,13,24,15))),
+                           GZMB_CD8 = list("GZMB_CD8",
+                                           c("CD8"),
+                                           list(c(28,21))),
+                           PD1_CD8 = list("PD1_CD8",
+                                          c("CD8"),
+                                          list(c(17,20))),
+                           PDL1_CD8 = list("PDL1_CD8",
+                                           c("CD8"),
+                                           list(c(4,23,7,13,14))),
+                           LAG3_CD4 = list("LAG3_CD4",
+                                           c("CD4"),
+                                           list(c(4,3))),
+                           CTLA4_CD4 = list("CTLA4_CD4",
+                                            c("CD4"),
+                                            list(c(11))),
+                           PD1_CD4 = list("PD1_CD4",
+                                          c("CD4"),
+                                          list(c(1,4,20))),
+                           PDL1_CD4 = list("PDL1_CD4",
+                                           c("CD4"),
+                                           list(c(13))),
+                           TIM3_CD4 = list("TIM3_CD4",
+                                           c("CD4"),
+                                           list(c(15,6))),
+                           TFH_CD4 = list("TFH_CD4",
+                                           c("CD4"),
+                                           list(c(14,1,6,20))),
+                           CXCR3_CD4 = list("CXCR3_CD4",
+                                           c("CD4"),
+                                           list(c(16,20,4,1,18))),
+                           CXCR5_HRS = list("CXCR5_HRS",
+                                            c("HRS"),
+                                            list(c(20,7,6))),
+                           GATA3_HRS = list("GATA3_HRS",
+                                            c("HRS"),
+                                            list(c(12,2,24,23,3))),
+                           PDL1_HRS = list("PDL1_HRS",
+                                           c("HRS"),
+                                           list(c(10))),
+                           CD123_HRS = list("CD123_HRS",
+                                            c("HRS"),
+                                            list(c(3,24,2))),
+                           Galectin9_HRS = list("Galectin9_HRS",
+                                                c("HRS"),
+                                                list(c(25))),
+                           Ki67_HRS = list("Ki67_HRS",
+                                           c("HRS"),
+                                           list(c(13,23,9,3,15))),
+                           HLAABC_HRS = list("HLAABC_HRS",
+                                             c("HRS"),
+                                             list(c(8,12,19,7,6,2,5,24,14,11,10,9,3,15))),
+                           HLADPDQDR_HRS = list("HLADPDQDR_HRS",
+                                                c("HRS"),
+                                                list(c(12,21,6,2,24,14,11,10,23,3,15))),
+                           PDL1CD80_HRS = list("PDL1CD80_HRS",
+                                               c("HRS"),
+                                               list(c(3,10,24,2))),
+                           CD80_cDC = list("CD80_cDC",
+                                           c("cDC"),
+                                           list(c(17,10,22,9,3,13,19,14,2,12,16,6,25,20,23))),
+                           Galectin9_cDC = list("Galectin9_cDC",
+                                                c("cDC"),
+                                                list(c(17,10,22,3,14,2,12,16,6,20,23))),
+                           CXCR5_B = list("CXCR5_B",
+                                          c("B"),
+                                          list(c(7,28,13,9,8))),
+                           GZMB_pDC = list("GZMB_pDC",
+                                           c("pDC",
+                                             "Mac",
+                                             "Myel"),
+                                           list(c(23,7,9),
+                                                c(5,27),
+                                                c(32,23))),
+                           Galectin9_pDC = list("Galectin9_pDC",
+                                                c("pDC"),
+                                                list(c(8,14,18,21,13,11,26,24,4))),
+                           LAG3_Treg = list("LAG3_Treg",
+                                            c("Treg"),
+                                            list(c(3,17))),
+                           Foxp3_Treg = list("Foxp3_Treg",
+                                             c("Treg"),
+                                             list(c(11,10,3,15,9,16,21,7,17,6,4,8,13))),
+                           CTLA4_Treg = list("CTLA4_Treg",
+                                             c("Treg"),
+                                             list(c(19,2))),
+                           PD1_Treg = list("PD1_Treg",
+                                           c("Treg"),
+                                           list(c(20,2))),
+                           PDL1_Treg = list("PDL1_Treg",
+                                            c("Treg"),
+                                            list(c(7,8))),
+                           CD163_Mac_Myel = list("CD163_Mac_Myel",
+                                                 c("Mac",
+                                                   "Myel"),
+                                                 list(c(17,15,12,1,27,10,13),
+                                                      c(8,34,16,24,6))),
+                           CD163_Mac = list("CD163_Mac",
+                                            c("Mac"),
+                                            list(c(17,15,12,1,27,10,13))),
+                           CD123_Mac_Myel = list("CD123_Mac_Myel",
+                                                 c("Mac",
+                                                   "Myel"),
+                                                 list(c(8,6,5,3,31,15,4,12,27,10),
+                                                      c(23,7,24,11,26,5))),
+                           CD123_Mac = list("CD123_Mac",
+                                            c("Mac"),
+                                            list(c(8,6,5,3,31,15,4,12,27,10))),
+                           TIM3_Mac_Myel = list("TIM3_Mac_Myel",
+                                                c("Mac",
+                                                  "Myel"),
+                                                list(c(8,6,31,22,18,12,1,27),
+                                                     c(31,6,18,11,26,5))),
+                           TIM3_Mac = list("TIM3_Mac",
+                                           c("Mac"),
+                                           list(c(8,6,31,22,18,12,1,27))),
+                           PDL1_Mac_Myel = list("PDL1_Mac_Myel",
+                                                c("Mac",
+                                                  "Myel"),
+                                                list(c(3,28,31,11,1,27,14),
+                                                     c(29,24,26))),
+                           PDL1_Mac = list("PDL1_Mac",
+                                           c("Mac"),
+                                           list(c(3,28,31,11,1,27,14))),
+                           PD1_Mac_Myel = list("PD1_Mac_Myel",
+                                               c("Myel"),
+                                               list(c(28))),
+                           Galectin9_Mac = list("Galectin9_Mac",
+                                                c("Mac"),
+                                                list(c(8,3,28,31,16,21,11,7,20,30,2,18,4,12,1,27))),
+                           Galectin9_Mac_Myel = list("Galectin9_Mac_Myel",
+                                                c("Mac",
+                                                  "Myel"),
+                                                list(c(8,3,28,31,16,21,11,7,20,30,2,18,4,12,1,27),
+                                                     c(26,27,11,18,12,6))),
+                           CD80_Mac_Myel = list("CD80_Mac_Myel",
+                                                c("Mac",
+                                                  "Myel"),
+                                                list(c(8,6,3,28,31,16,21,7,20,30,17,2,18,4,12,1,27,9),
+                                                     c(9,31,1,17,32,16,7,6,12,18,19,11,27,26,5,28))),
+                           PDL1CD80_Mac_Myel = list("PDL1CD80_Mac_Myel",
+                                               c("Mac",
+                                                 "Myel"),
+                                               list(c(27,1,11,31,28,3,6,8),
+                                                    c(6,26))))
+
+
+newcellpos <- unname(unlist(newcelltypes[1]))
+
+```
+Cell subtype assignment
+```{r}
+
+# Go through list of new cell types to annotate
+for (type in 1:length(newcelltypes)){
+  # Set all cells to 0
+  data_in[, paste0(newcelltypes[[1,type]],"_pos") := 0]
+
+  # Extract subclusters to label based on heatmaps
+  typestoscan <- newcelltypes[[2,type]]
+  subclusterstoscan <- newcelltypes[[3,type]]
+
+  # Initialize list
+  targetindex <- vector("numeric")
+  for (j in 1:length(typestoscan))
+  {
+    # Identify correct cells by index in total dataset
+    #targetlist <- paste0("subset_",typestoscan[j],"_meta_",subclusterstoscan[[j]])
+    targetlist <- paste0("subset_",typestoscan[j],"_",subclusterstoscan[[j]])
+
+    pos_index <- which(data_in[[paste0(typestoscan[j],"_phenograph")]] %in% targetlist)
+    targetindex <- c(targetindex, pos_index)
+  }
+  # Remove duplicates
+  targetindex <- unique(targetindex)
+  # Relabel the incorrect clusters as corrected_core_phenograph
+  data_in[targetindex, paste0(newcelltypes[[1,type]],"_pos") := 1]
+}
+
+```
+
+Spatial Analysis
+```{r}
+# All core clustering distances
+# Enter target cells (major corrected cell types plus additional _pos markers)
+targetpositives <- c(correctedcelltypes, newcellpos)
+# Carry relevant data forward
+PointDatacols <- c("Unique_ROI_ID", "Location_Center_X", "Location_Center_Y", "ObjectNumber",
+                   panel_proteins, morphologymarkers, paste0(targetpositives,"_pos"))
+PointDatalocation <- c("Location_Center_X","Location_Center_Y", "ObjectNumber")
+
+ROIsourcedata <- copy(data_in[,..PointDatacols])
+NNtarget <- 5
+
+for (ROIImage in unique(data_in$Unique_ROI_ID))
+{
+  # Extract ROI data
+  ROIsubset <- ROIsourcedata[Unique_ROI_ID==ROIImage]
+
+  # Make dummy cells
+  ROIdummy <- copy(ROIsubset[1:NNtarget])
+  ROIdummy[,ObjectNumber := 1000000:(1000000+NNtarget-1)]
+  ROIdummy[, which(colnames(ROIdummy) %like% "_pos") := 1]
+  ROIdummy[, which(colnames(ROIdummy) %like% "Location_Center") := 1000000:(1000000+NNtarget-1)]
+
+  ROIsubset <- rbind(ROIsubset, ROIdummy)
+
+  # For each cell type i
+  X <- ppp(x = ROIsubset[,Location_Center_X],
+           y = ROIsubset[,Location_Center_Y],
+           window = owin(c(ROIsubset[,min(Location_Center_X)],
+                           ROIsubset[,max(Location_Center_X)]),
+                         c(ROIsubset[,min(Location_Center_Y)],
+                           ROIsubset[,max(Location_Center_Y)])),
+           # marks = ROIsubset[,..PointDatalocation],
+           unitname = "micrometer")
+  # Prepare dataset for cell subset
+
+  NNsubi <- ROIsubset[,..PointDatalocation]
+
+  # Compare to each cell type j
+  for(j in targetpositives){
+    # Generate points
+    index_j <- ROIsubset[[paste0(j,"_pos")]]==1
+
+    Y <- ppp(x = ROIsubset[index_j,Location_Center_X],
+             y = ROIsubset[index_j,Location_Center_Y],
+             window = owin(c(ROIsubset[,min(Location_Center_X)],
+                             ROIsubset[,max(Location_Center_X)]),
+                           c(ROIsubset[,min(Location_Center_Y)],
+                             ROIsubset[,max(Location_Center_Y)])),
+             # marks = ROIsubset[index_j,..PointDatalocation],
+             unitname = "micrometer")
+
+    # Find spatial nearest neighbors of i in j
+    NNdataj <- as.data.table(nncross(X,Y,k=1:NNtarget,
+                                     iX=as.integer(ROIsubset$ObjectNumber),
+                                     iY=as.integer(ROIsubset[index_j]$ObjectNumber)))
+
+
+    # Find cells by object number instead of index
+    NNdataj[, which(names(NNdataj) %like% "which") := lapply(.SD, function(x) ROIsubset[index_j][x,ObjectNumber]), .SDcols = names(NNdataj) %like% "which"]
+
+    # Name the columns for cell type j
+    colnames(NNdataj) <- paste0(j, ".", colnames(NNdataj))
+
+    # Store data
+    NNsubi <- cbind(NNsubi, NNdataj)
+  }
+  # Perform centroid calculations
+  Xcentroids <- vector("list",length(targetpositives))
+  Ycentroids <- vector("list",length(targetpositives))
+  NNcentroiddistances <- vector("list", length(targetpositives))
+
+  # For every cell type
+  for (cluster in 1:length(targetpositives))
+  {
+    # Identify the columns containing spatial data for type
+    coltargets <- names(NNsubi)[names(NNsubi) %like% paste0("^",targetpositives[cluster],".which")]
+    NNminiX <- NNsubi[,..coltargets]
+    NNminiX[,(coltargets) := lapply(.SD, function(x) ROIsubset[match(x, ObjectNumber),Location_Center_X]), .SDcols=coltargets]
+    NNminiY[,(coltargets) := lapply(.SD, function(x) ROIsubset[match(x, ObjectNumber),Location_Center_Y]), .SDcols=coltargets]
+    # Calculate X,Y centroid for each cell type
+    Xcentroids[[cluster]] <- NNminiX[,rowMeans(NNminiX, na.rm=T)]
+    Ycentroids[[cluster]] <- NNminiY[,rowMeans(NNminiY, na.rm=T)]
+
+    # Calculate distance from each cell to each centroid for each cell type
+    NNcentroiddistances[[cluster]] <- sqrt((Xcentroids[[cluster]]-NNsubi$Location_Center_X)^2 + (Ycentroids[[cluster]]-NNsubi$Location_Center_Y)^2)
+  }
+
+  # Store new distance data for centroids
+  newnncentroidcols <- apply(expand.grid(c("NN.centroid.X.","NN.centroid.Y.","NN.centroiddist."), targetpositives), 1, paste, collapse="")
+
+  idx <- order(c(seq_along(Xcentroids), seq_along(Ycentroids), seq_along(NNcentroiddistances)))
+
+  NNsubi[, (newnncentroidcols) := (c(Xcentroids, Ycentroids, NNcentroiddistances))[idx]]
+
+  # Substitute spatial calculations back in to ROI subset data
+  spatialcolumns <- names(NNsubi)[(names(NNsubi) %like% "dist") | (names(NNsubi) %like% "NN")]
+  spatialdata <- NNsubi[,..spatialcolumns]
+  spatialdata <- spatialdata[1:(nrow(spatialdata)-5)]
+
+  data_in[Unique_ROI_ID==ROIImage, (spatialcolumns) := spatialdata]
+}
+
+
+for (k in targetpositives){
+  regexin <- paste0("centroiddist[.]",k,"|","^",k,"[.]")
+  
+  distancecols <- colnames(data_in)[grep(regexin, colnames(data_in))]
+  
+  censoreddistance <- censor(data_in[,..distancecols],cap=cap)
+  
+  data_in[,(distancecols) := (censoreddistance)/(cap)]
+}
+
+
+# TMAs <- unique(data_in$TMA_ID)
+spatialcombos <- apply(expand.grid(ROIs, targetpositives), 1, paste, collapse="_")
+
+# Summarize each targetpositive distance
+for (target in targetpositives){
+  regexin <- paste0("^",target,"[.]")
+  distancecols <- colnames(data_in)[grep(regexin, colnames(data_in))]
+  
+  data_in[, paste0(target, "_summary_metric") := (NNtarget-rowSums(.SD))/NNtarget, .SDcols=distancecols]
+  
+}
+
+```
+
